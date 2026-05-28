@@ -1,99 +1,140 @@
 #!/usr/bin/env python3
 """
-Hunter Raid Mod Injector - DeathLantern Edition
-Merges split APKs and injects mod library
+Hunter Raid Mod Injector v2 - DeathLantern
+Merges split APKs, injects mod library, patches DEX
 """
 import zipfile
 import os
-import struct
+import sys
 import shutil
+import struct
 
-import logging
-logging.disable(logging.DEBUG)
+print("=" * 60)
+print("Hunter Raid Mod Injector - DeathLantern Edition")
+print("=" * 60)
 
-from androguard.core.dex import DEX
-from androguard.core.dex import EncodedMethod
+BASE_APK = "temp/studio.gameberry.idlehunter.apk"
+CONFIG_APK = "temp/config.arm64_v8a.apk"
+MOD_LIB = "libDeathLantern.so"
+DECOMPILED = "temp/decompiled"
+OUTPUT = "output/unsigned.apk"
 
-def merge_apks(base_apk, config_apk, output_apk, mod_lib_path):
-    """Merge base APK + config APK into single APK with mod library"""
-    print(f"[1/4] Merging APKs...")
-    
-    # Read config APK's lib files
-    config_libs = {}
-    with zipfile.ZipFile(config_apk, 'r') as z:
-        for name in z.namelist():
-            if name.startswith('lib/arm64-v8a/'):
-                config_libs[name] = z.read(name)
-                print(f"  Adding: {name} ({len(config_libs[name])//1024}KB)")
-    
-    # Read mod library
-    with open(mod_lib_path, 'rb') as f:
-        mod_lib = f.read()
-    config_libs['lib/arm64-v8a/libDeathLantern.so'] = mod_lib
-    print(f"  Adding: lib/arm64-v8a/libDeathLantern.so ({len(mod_lib)//1024}KB)")
-    
-    # Create merged APK
-    print(f"[2/4] Creating merged APK...")
-    with zipfile.ZipFile(base_apk, 'r') as zin:
-        with zipfile.ZipFile(output_apk, 'w', zipfile.ZIP_DEFLATED) as zout:
-            for item in zin.namelist():
-                data = zin.read(item)
-                
-                # Modify DEX files to load mod library
-                if item.startswith('classes') and item.endswith('.dex'):
-                    print(f"  Processing {item}...")
-                    data = patch_dex(item, data)
-                
-                zout.writestr(item, data)
+# Step 1: Merge APKs
+print("\n[1/5] Merging split APKs...")
+config_libs = {}
+with zipfile.ZipFile(CONFIG_APK, 'r') as z:
+    for name in z.namelist():
+        if name.startswith('lib/arm64-v8a/'):
+            config_libs[name] = z.read(name)
+            print(f"  + {name} ({len(config_libs[name])//1024}KB)")
+
+# Add mod library
+with open(MOD_LIB, 'rb') as f:
+    mod_data = f.read()
+config_libs['lib/arm64-v8a/libDeathLantern.so'] = mod_data
+print(f"  + lib/arm64-v8a/libDeathLantern.so ({len(mod_data)//1024}KB) [MOD]")
+
+# Create merged APK
+merged_apk = "temp/merged.apk"
+with zipfile.ZipFile(BASE_APK, 'r') as zin:
+    with zipfile.ZipFile(merged_apk, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.namelist():
+            zout.writestr(item, zin.read(item))
+        for name, data in config_libs.items():
+            zout.writestr(name, data)
+
+print(f"  Merged APK: {os.path.getsize(merged_apk)//1024//1024}MB")
+
+# Step 2: Decompile with apktool
+print("\n[2/5] Decompiling with apktool...")
+os.system(f"java -jar /usr/local/bin/apktool.jar d {merged_apk} -o {DECOMPILED} -f")
+
+if not os.path.exists(DECOMPILED):
+    print("  ERROR: Decompilation failed!")
+    print("  Falling back to direct merge approach...")
+    shutil.copy(merged_apk, OUTPUT)
+    sys.exit(0)
+
+# Step 3: Create mod loader smali
+print("\n[3/5] Creating mod loader smali...")
+
+# Find smali directories
+smali_dirs = sorted([d for d in os.listdir(DECOMPILED) if d.startswith('smali')])
+print(f"  Found smali dirs: {smali_dirs}")
+
+# Create ModLoader class in the first smali directory
+mod_dir = os.path.join(DECOMPILED, smali_dirs[-1], 'com', 'deathlantern')
+os.makedirs(mod_dir, exist_ok=True)
+
+mod_smali = """.class public Lcom/deathlantern/ModLoader;
+.super Ljava/lang/Object;
+
+.method public constructor <init>()V
+    .registers 1
+    invoke-direct {p0}, Ljava/lang/Object;-><init>()V
+    return-void
+.end method
+
+.method public static loadMod()V
+    .registers 1
+    const-string v0, "DeathLantern"
+    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
+    return-void
+.end method
+"""
+
+with open(os.path.join(mod_dir, 'ModLoader.smali'), 'w') as f:
+    f.write(mod_smali)
+print(f"  Created: {os.path.join(mod_dir, 'ModLoader.smali')}")
+
+# Step 4: Patch Activity classes to load mod
+print("\n[4/5] Patching Activity classes...")
+
+# Find and patch MessagingUnityPlayerActivity and UnityPlayerActivity
+targets = [
+    ('com/google/firebase/MessagingUnityPlayerActivity.smali', 'MessagingUnityPlayerActivity'),
+    ('com/unity3d/player/UnityPlayerActivity.smali', 'UnityPlayerActivity'),
+]
+
+for smali_dir_name in smali_dirs:
+    smali_dir = os.path.join(DECOMPILED, smali_dir_name)
+    for rel_path, class_name in targets:
+        smali_path = os.path.join(smali_dir, rel_path)
+        if os.path.exists(smali_path):
+            with open(smali_path, 'r') as f:
+                content = f.read()
             
-            # Add config APK's lib files
-            for name, data in config_libs.items():
-                zout.writestr(name, data)
-    
-    print(f"[3/4] APK created: {os.path.getsize(output_apk)//1024//1024}MB")
-    print(f"[4/4] Done!")
+            # Find onCreate method and inject loadMod call
+            if 'onCreate' in content and 'loadMod' not in content:
+                # Replace .locals in onCreate with .locals + 1 and add loadMod call
+                old_oncreate = '.method public onCreate(Landroid/os/Bundle;)V\n    .locals'
+                new_oncreate = '.method public onCreate(Landroid/os/Bundle;)V\n    .locals 2\n\n    invoke-static {}, Lcom/deathlantern/ModLoader;->loadMod()V\n'
+                
+                if old_oncreate in content:
+                    content = content.replace(old_oncreate, new_oncreate, 1)
+                    with open(smali_path, 'w') as f:
+                        f.write(content)
+                    print(f"  Patched: {smali_dir_name}/{rel_path}")
+                else:
+                    # Try alternative pattern
+                    lines = content.split('\n')
+                    new_lines = []
+                    in_oncreate = False
+                    for line in lines:
+                        new_lines.append(line)
+                        if '.method public onCreate(Landroid/os/Bundle;)V' in line and not in_oncreate:
+                            in_oncreate = True
+                            new_lines.append('    .registers 2')
+                            new_lines.append('')
+                            new_lines.append('    invoke-static {}, Lcom/deathlantern/ModLoader;->loadMod()V')
+                            # Skip the original .registers line if it follows
+                            continue
+                    content = '\n'.join(new_lines)
+                    with open(smali_path, 'w') as f:
+                        f.write(content)
+                    print(f"  Patched (alt): {smali_dir_name}/{rel_path}")
 
-def patch_dex(dex_name, dex_data):
-    """Patch DEX to load mod library in MessagingUnityPlayerActivity.onCreate"""
-    d = DEX(dex_data)
-    
-    patched = False
-    for cls in d.get_classes():
-        cls_name = cls.get_name()
-        
-        # Target: MessagingUnityPlayerActivity or UnityPlayerActivity
-        if 'MessagingUnityPlayerActivity;' == cls_name or cls_name == 'Lcom/unity3d/player/UnityPlayerActivity;':
-            for method in cls.get_methods():
-                if method.get_name() == 'onCreate':
-                    # We'll use binary patching approach
-                    # Find "DeathLantern" string offset or add loadLibrary call
-                    patched = True
-                    print(f"    Found {cls_name}.onCreate")
-    
-    return dex_data
-
-if __name__ == '__main__':
-    os.makedirs("output", exist_ok=True)
-    
-    base_apk = "temp/studio.gameberry.idlehunter.apk"
-    config_apk = "temp/config.arm64_v8a.apk"
-    mod_lib = "libDeathLantern.so"  # Downloaded from release
-    output_apk = "output/modded.apk"
-    
-    # Download mod library from release
-    if not os.path.exists(mod_lib):
-        import urllib.request
-        print("Downloading mod library from GitHub release...")
-        release_url = "https://api.github.com/repos/mangogold912-droid/hunter-raid-mod/releases/tags/v2.6.9-mod"
-        req = urllib.request.Request(release_url, headers={"Accept": "application/vnd.github.v3+json"})
-        resp = urllib.request.urlopen(req)
-        release = json.loads(resp.read())
-        for asset in release.get('assets', []):
-            if asset['name'] == 'libDeathLantern.so':
-                print(f"  Downloading {asset['name']}...")
-                urllib.request.urlretrieve(asset['browser_download_url'], mod_lib)
-                break
-    
-    merge_apks(base_apk, config_apk, output_apk, mod_lib)
-    print(f"\nModded APK: {output_apk}")
-    print(f"Size: {os.path.getsize(output_apk)//1024//1024}MB")
+# Step 5: Done
+print("\n[5/5] Injection complete!")
+print(f"\nDecompiled directory: {DECOMPILED}")
+print("Ready for recompilation with apktool")
