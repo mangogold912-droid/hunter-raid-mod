@@ -1,0 +1,5 @@
+# Build trigger
+# This file triggers GitHub Actions build
+version: 2.7.1
+mod: DeathLantern
+date: 2026-05-28
