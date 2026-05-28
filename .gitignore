@@ -1,0 +1,10 @@
+*.apk
+*.keystore
+*.so
+*.dat
+*.jar
+__pycache__/
+*.pyc
+build/
+.gradle/
+.DS_Store
