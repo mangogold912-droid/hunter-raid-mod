@@ -22,80 +22,88 @@ jobs:
       
       - name: Install tools
         run: |
-          wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar -O /usr/local/bin/apktool.jar || true
+          wget -q "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar" -O /usr/local/bin/apktool.jar || true
       
       - name: Download release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p temp output
-          
-          # Use gh CLI to download release assets
-          gh release download v2.6.9-mod --repo mangogold912-droid/hunter-raid-mod \
-            -p 'base.apk' -D temp/ || true
+          gh release download v2.6.9-mod --repo mangogold912-droid/hunter-raid-mod -p 'base.apk' -D temp/ || true
           mv temp/base.apk temp/studio.gameberry.idlehunter.apk 2>/dev/null || true
-          
-          gh release download v2.6.9-mod --repo mangogold912-droid/hunter-raid-mod \
-            -p 'config.arm64_v8a.apk' -D temp/ || true
-          
-          gh release download v2.6.9-mod --repo mangogold912-droid/hunter-raid-mod \
-            -p 'libDeathLantern.so' || true
-          
-          echo "Downloaded files:"
-          ls -lhR temp/ libDeathLantern.so 2>/dev/null || echo "Some files missing"
+          gh release download v2.6.9-mod --repo mangogold912-droid/hunter-raid-mod -p 'config.arm64_v8a.apk' -D temp/ || true
+          gh release download v2.6.9-mod --repo mangogold912-droid/hunter-raid-mod -p 'libDeathLantern.so' || true
       
-      - name: Merge and inject
+      - name: Merge APKs
         run: |
-          # First merge APKs
-          python3 << 'MERGE'
+          python3 -c "
           import zipfile, os
-          
-          os.makedirs("output", exist_ok=True)
-          
-          # Read config libs
           config_libs = {}
-          with zipfile.ZipFile("temp/config.arm64_v8a.apk", 'r') as z:
-              for name in z.namelist():
-                  if name.startswith('lib/arm64-v8a/'):
-                      config_libs[name] = z.read(name)
-          
-          # Add mod library
-          with open("libDeathLantern.so", 'rb') as f:
+          with zipfile.ZipFile('temp/config.arm64_v8a.apk','r') as z:
+              for n in z.namelist():
+                  if n.startswith('lib/arm64-v8a/'):
+                      config_libs[n] = z.read(n)
+          with open('libDeathLantern.so','rb') as f:
               config_libs['lib/arm64-v8a/libDeathLantern.so'] = f.read()
-          
-          # Merge into base APK
-          merged = "temp/merged.apk"
-          with zipfile.ZipFile("temp/studio.gameberry.idlehunter.apk", 'r') as zin:
-              with zipfile.ZipFile(merged, 'w', zipfile.ZIP_DEFLATED) as zout:
+          with zipfile.ZipFile('temp/studio.gameberry.idlehunter.apk','r') as zin:
+              with zipfile.ZipFile('temp/merged.apk','w',zipfile.ZIP_DEFLATED) as zout:
                   for item in zin.namelist():
                       zout.writestr(item, zin.read(item))
-                  for name, data in config_libs.items():
-                      zout.writestr(name, data)
+                  for n,d in config_libs.items():
+                      zout.writestr(n, d)
+          print(f'Merged: {os.path.getsize("temp/merged.apk")//1024//1024}MB')
+          "
+      
+      - name: Decompile and fix manifest
+        run: |
+          java -jar /usr/local/bin/apktool.jar d temp/merged.apk -o temp/decompiled -f || true
           
-          print(f"Merged APK: {os.path.getsize(merged)//1024//1024}MB")
-          MERGE
+          # Create apktool.yml
+          cat > temp/decompiled/apktool.yml << 'YML'
+          !!brut.androlib.apktool.MetaInfo
+          apkFileName: merged.apk
+          doNotCompress:
+            - resources.arsc
+            - assets/bin/Data/Managed/Metadata/global-metadata.dat
+            - png
+          isFrameworkApk: false
+          packageInfo:
+            forcedPackageId: '127'
+            renameManifestPackage: null
+          sdkInfo:
+            minSdkVersion: '24'
+            targetSdkVersion: '35'
+          sharedLibrary: false
+          sparseResources: false
+          unknownFiles: {}
+          usesFramework:
+            ids:
+            - 1
+            tag: null
+          version: 2.9.3
+          versionInfo:
+            versionCode: '286'
+            versionName: 2.7.1
+          YML
           
-          # Decompile with apktool
-          echo "Decompiling..."
-          java -jar /usr/local/bin/apktool.jar d temp/merged.apk -o temp/decompiled -f || {
-            echo "Decompile failed, using direct merge"
-            cp temp/merged.apk output/unsigned.apk
-            echo "SKIP_RECOMPILE=1" >> $GITHUB_ENV
-          }
-          
-          if [ -d "temp/decompiled" ] && [ "$SKIP_RECOMPILE" != "1" ]; then
-            # Create mod loader smali
-            mkdir -p temp/decompiled/smali/com/deathlantern
-            cat > temp/decompiled/smali/com/deathlantern/ModLoader.smali << 'SMALI'
+          # FIX: Remove split APK dependencies from AndroidManifest.xml
+          sed -i 's/ android:requiredSplitTypes="[^"]*"//g' temp/decompiled/AndroidManifest.xml
+          sed -i 's/ android:splitTypes="[^"]*"//g' temp/decompiled/AndroidManifest.xml
+          sed -i '/com\.android\.vending\.splits\.required/d' temp/decompiled/AndroidManifest.xml
+          sed -i '/com\.android\.vending\.splits"/d' temp/decompiled/AndroidManifest.xml
+          echo "Manifest fixed!"
+      
+      - name: Create ModLoader smali
+        run: |
+          mkdir -p temp/decompiled/smali/com/deathlantern
+          cat > temp/decompiled/smali/com/deathlantern/ModLoader.smali << 'SMALI'
           .class public Lcom/deathlantern/ModLoader;
           .super Ljava/lang/Object;
-          
           .method public constructor <init>()V
               .registers 1
               invoke-direct {p0}, Ljava/lang/Object;-><init>()V
               return-void
           .end method
-          
           .method public static loadMod()V
               .registers 1
               const-string v0, "DeathLantern"
@@ -103,46 +111,32 @@ jobs:
               return-void
           .end method
           SMALI
-            
-            # Patch Activity classes
-            echo "Patching activities..."
-            for smali_file in $(find temp/decompiled/smali* -name "MessagingUnityPlayerActivity.smali" -o -name "UnityPlayerActivity.smali" 2>/dev/null); do
-              if grep -q "onCreate" "$smali_file" && ! grep -q "loadMod" "$smali_file"; then
-                echo "Patching $smali_file..."
-                sed -i 's/\.method public onCreate(Landroid\/os\/Bundle;)V/\.method public onCreate(Landroid\/os\/Bundle;)V\n    .registers 2\n\n    invoke-static {}, Lcom\/deathlantern\/ModLoader;->loadMod()V/' "$smali_file"
-              fi
-            done
-            
-            # Recompile
-            echo "Recompiling..."
-            java -jar /usr/local/bin/apktool.jar b temp/decompiled -o output/unsigned.apk --use-aapt2 || {
-              echo "Recompile failed, using direct merge"
-              cp temp/merged.apk output/unsigned.apk
-            }
-          fi
           
-          ls -lh output/
+          # Patch activities
+          for f in $(find temp/decompiled/smali* -name "MessagingUnityPlayerActivity.smali" -o -name "UnityPlayerActivity.smali" 2>/dev/null); do
+            if grep -q "onCreate" "$f" && ! grep -q "loadMod" "$f"; then
+              echo "Patching $f..."
+              sed -i 's/\.method public onCreate(Landroid\/os\/Bundle;)V/\.method public onCreate(Landroid\/os\/Bundle;)V\n    .registers 2\n\n    invoke-static {}, Lcom\/deathlantern\/ModLoader;->loadMod()V/' "$f"
+            fi
+          done
       
-      - name: Sign APK
+      - name: Build and sign
         run: |
-          # Generate keystore
-          keytool -genkeypair -v \
-            -keystore debug.keystore \
-            -alias deathlantern \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -storepass deathlantern \
-            -keypass deathlantern \
+          java -jar /usr/local/bin/apktool.jar b temp/decompiled -o output/unsigned.apk --use-aapt2 || {
+            echo "apktool failed, using direct merge"
+            cp temp/merged.apk output/unsigned.apk
+          }
+          
+          keytool -genkeypair -v -keystore debug.keystore -alias deathlantern \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass deathlantern -keypass deathlantern \
             -dname "CN=DeathLantern,O=Mod,C=KR"
           
-          # Sign
           jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
             -keystore debug.keystore -storepass deathlantern -keypass deathlantern \
             output/unsigned.apk deathlantern
           
           mv output/unsigned.apk output/hunter-raid-mod-v2.7.1.apk
-          echo "Final APK:"
           ls -lh output/
       
       - name: Upload artifact
@@ -151,23 +145,11 @@ jobs:
           name: HunterRaid-Mod-v2.7.1-DeathLantern
           path: output/hunter-raid-mod-v2.7.1.apk
       
-      - name: Create release
+      - name: Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v2.7.1-mod
           name: "Hunter Raid v2.7.1 Mod - DeathLantern"
-          body: |
-            ## 헌터키우기 모딩 APK v2.7.1
-            
-            **DeathLantern Edition**
-            
-            - libDeathLantern.so 런타임 훅
-            - DEX 모드 로딩 코드 추가  
-            - 커스텀 서명
-            
-            ### 설치
-            1. 기존 앱 삭제
-            2. APK 설치
           files: output/hunter-raid-mod-v2.7.1.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
