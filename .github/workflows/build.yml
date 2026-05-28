@@ -1,0 +1,52 @@
+name: Build Modded APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+      
+      - name: Install tools
+        run: |
+          pip3 install androguard
+          sudo apt-get update && sudo apt-get install -y apktool zipalign
+      
+      - name: Download latest APK
+        run: |
+          python3 scripts/download_apk.py
+      
+      - name: Inject mod
+        run: |
+          python3 scripts/inject_mod.py
+      
+      - name: Sign APK
+        run: |
+          keytool -genkeypair -v -keystore debug.keystore -alias debug -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=DeathLantern,O=Mod,C=KR"
+          jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 -keystore debug.keystore -storepass android -keypass android output/modded.apk debug
+          zipalign -f 4 output/modded.apk output/hunter-raid-mod-signed.apk
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HunterRaid-Mod-v2.7.1
+          path: output/hunter-raid-mod-signed.apk
+      
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v2.7.1-mod
+          name: Hunter Raid v2.7.1 Modded - DeathLantern
+          files: output/hunter-raid-mod-signed.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
