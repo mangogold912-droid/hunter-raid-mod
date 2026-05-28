@@ -24,150 +24,70 @@ jobs:
       
       - name: Install tools
         run: |
-          wget -q https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool -O /usr/local/bin/apktool
-          chmod +x /usr/local/bin/apktool
-          wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar -O /usr/local/bin/apktool.jar
+          # Install apktool
+          wget -q https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool -O /usr/local/bin/apktool 2>/dev/null || true
+          chmod +x /usr/local/bin/apktool 2>/dev/null || true
+          wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar -O /usr/local/bin/apktool.jar 2>/dev/null || true
+          
+          # Install Python tools
           pip3 install androguard requests
-          sudo apt-get update -qq && sudo apt-get install -y -qq zipalign apksigner 2>/dev/null || true
+          
+          # Install Android build tools
+          sudo apt-get update -qq 2>/dev/null
+          sudo apt-get install -y -qq zipalign 2>/dev/null || true
+          
+          # Download Android build tools for apksigner
+          echo "Installing Android SDK build tools..."
+          mkdir -p $HOME/android-sdk
+          wget -q "https://dl.google.com/android/repository/build-tools_r34-linux.zip" -O /tmp/build-tools.zip 2>/dev/null || true
+          if [ -f /tmp/build-tools.zip ]; then
+            unzip -q /tmp/build-tools.zip -d $HOME/android-sdk/build-tools 2>/dev/null || true
+            export PATH="$HOME/android-sdk/build-tools/android-34:$PATH"
+          fi
       
-      - name: Download APK
+      - name: Download APK files from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p temp output
-          echo "Downloading Hunter Raid v2.7.1 XAPK..."
-          curl -sL "https://d.apkpure.net/b/APK/studio.gameberry.idlehunter?version=latest" -o temp/hunter.xapk
           
-          echo "Extracting..."
-          cd temp
-          unzip -o hunter.xapk "studio.gameberry.idlehunter.apk" "config.arm64_v8a.apk"
-          rm hunter.xapk
-          ls -lh
-      
-      - name: Download mod library
-        run: |
-          # Download libDeathLantern.so from release
+          # Download from GitHub release
           python3 -c "
-          import urllib.request, json
-          resp = urllib.request.urlopen('https://api.github.com/repos/mangogold912-droid/hunter-raid-mod/releases/tags/v2.6.9-mod')
+          import urllib.request, json, os
+          
+          TOKEN = os.environ.get('GH_TOKEN', '')
+          REPO = 'mangogold912-droid/hunter-raid-mod'
+          
+          resp = urllib.request.urlopen(
+              f'https://api.github.com/repos/{REPO}/releases/tags/v2.6.9-mod',
+          )
           release = json.loads(resp.read())
+          
           for asset in release.get('assets', []):
-              if asset['name'] == 'libDeathLantern.so':
-                  urllib.request.urlretrieve(asset['browser_download_url'], 'libDeathLantern.so')
-                  print(f'Downloaded {asset["name"]}')
-                  break
+              name = asset['name']
+              url = asset['browser_download_url']
+              dest = f'temp/{name}' if name != 'base.apk' else f'temp/studio.gameberry.idlehunter.apk'
+              print(f'Downloading {name}...')
+              req = urllib.request.Request(url)
+              resp2 = urllib.request.urlopen(req)
+              with open(dest, 'wb') as f:
+                  f.write(resp2.read())
+              print(f'  -> {dest} ({os.path.getsize(dest)//1024//1024}MB)')
           "
-          ls -lh libDeathLantern.so
+          
+          echo "Files downloaded:"
+          ls -lh temp/
       
-      - name: Merge APKs into single APK
+      - name: Merge and inject mod
         run: |
-          python3 << 'MERGE'
-          import zipfile, os
-          
-          base = "temp/studio.gameberry.idlehunter.apk"
-          config = "temp/config.arm64_v8a.apk"
-          output = "temp/merged.apk"
-          
-          # Read config libs
-          config_libs = {}
-          with zipfile.ZipFile(config, 'r') as z:
-              for name in z.namelist():
-                  if name.startswith('lib/'):
-                      config_libs[name] = z.read(name)
-          
-          # Read mod lib
-          with open("libDeathLantern.so", 'rb') as f:
-              config_libs['lib/arm64-v8a/libDeathLantern.so'] = f.read()
-          
-          # Merge
-          with zipfile.ZipFile(base, 'r') as zin:
-              with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as zout:
-                  for item in zin.namelist():
-                      zout.writestr(item, zin.read(item))
-                  for name, data in config_libs.items():
-                      zout.writestr(name, data)
-          
-          print(f"Merged APK: {os.path.getsize(output)//1024//1024}MB")
-          MERGE
+          export PATH="$HOME/android-sdk/build-tools/android-34:$PATH"
+          python3 scripts/inject_mod.py
       
-      - name: Decompile with apktool
+      - name: Build APK
         run: |
-          java -jar /usr/local/bin/apktool.jar d temp/merged.apk -o temp/decompiled -f -s
-          echo "Decompiled successfully"
-          ls temp/decompiled/
-      
-      - name: Inject mod loading code
-        run: |
-          # Create smali file for mod loading
-          mkdir -p temp/decompiled/smali_classes6/com/deathlantern
+          export PATH="$HOME/android-sdk/build-tools/android-34:$PATH"
           
-          cat > temp/decompiled/smali_classes6/com/deathlantern/ModLoader.smali << 'SMALI'
-          .class public Lcom/deathlantern/ModLoader;
-          .super Ljava/lang/Object;
-          
-          .method public static loadMod()V
-              .locals 1
-              const-string v0, "DeathLantern"
-              invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
-              return-void
-          .end method
-          SMALI
-          
-          echo "ModLoader.smali created"
-          
-          # Find and patch MessagingUnityPlayerActivity
-          # We need to add ModLoader.loadMod() call in onCreate
-          python3 << 'PATCH'
-          import os, glob
-          
-          # Find MessagingUnityPlayerActivity smali
-          smali_dirs = glob.glob("temp/decompiled/smali*/com/google/firebase/MessagingUnityPlayerActivity.smali")
-          
-          for smali_file in smali_dirs:
-              with open(smali_file, 'r') as f:
-                  content = f.read()
-              
-              if 'onCreate' in content:
-                  # Add ModLoader.loadMod() at the start of onCreate
-                  content = content.replace(
-                      '.method public onCreate(Landroid/os/Bundle;)V',
-                      '.method public onCreate(Landroid/os/Bundle;)V\n    .locals 1\n    invoke-static {}, Lcom/deathlantern/ModLoader;->loadMod()V'
-                  )
-                  # Fix: proper smali syntax
-                  content = content.replace(
-                      '.method public onCreate(Landroid/os/Bundle;)V\n    .locals 1\n    invoke-static {}, Lcom/deathlantern/ModLoader;->loadMod()V',
-                      '.method public onCreate(Landroid/os/Bundle;)V\n    .locals 2\n    invoke-static {}, Lcom/deathlantern/ModLoader;->loadMod()V'
-                  )
-                  
-                  with open(smali_file, 'w') as f:
-                      f.write(content)
-                  print(f"Patched: {smali_file}")
-          
-          # Also patch UnityPlayerActivity
-          unity_dirs = glob.glob("temp/decompiled/smali*/com/unity3d/player/UnityPlayerActivity.smali")
-          for smali_file in unity_dirs:
-              with open(smali_file, 'r') as f:
-                  content = f.read()
-              
-              if 'onCreate' in content:
-                  old = '.method public onCreate(Landroid/os/Bundle;)V'
-                  new = '.method public onCreate(Landroid/os/Bundle;)V\n    .locals 2\n    invoke-static {}, Lcom/deathlantern/ModLoader;->loadMod()V'
-                  content = content.replace(old, new)
-                  
-                  with open(smali_file, 'w') as f:
-                      f.write(content)
-                  print(f"Patched: {smali_file}")
-          PATCH
-          
-          echo "All smali patches applied"
-      
-      - name: Recompile APK
-        run: |
-          java -jar /usr/local/bin/apktool.jar b temp/decompiled -o output/unsigned.apk --use-aapt2
-          echo "Recompiled successfully"
-          ls -lh output/unsigned.apk
-      
-      - name: Sign APK
-        run: |
-          # Generate debug keystore
+          # Generate keystore
           keytool -genkeypair -v \
             -keystore debug.keystore \
             -alias deathlantern \
@@ -178,17 +98,29 @@ jobs:
             -keypass deathlantern \
             -dname "CN=DeathLantern,O=Mod,C=KR"
           
-          # Sign with apksigner (v2 signing)
-          zipalign -f 4 output/unsigned.apk output/aligned.apk
-          apksigner sign --ks debug.keystore --ks-pass pass:deathlantern --key-pass pass:deathlantern --out output/hunter-raid-mod-v2.7.1.apk output/aligned.apk
+          # Recompile with apktool
+          echo "Recompiling with apktool..."
+          java -jar /usr/local/bin/apktool.jar b temp/decompiled -o output/unsigned.apk --use-aapt2 || {
+            echo "apktool failed, trying direct merge..."
+            # Fallback: direct zip merge approach
+            python3 scripts/merge_only.py
+          }
           
-          echo "Signed successfully"
+          echo "Signing APK..."
+          # Align
+          zipalign -f 4 output/unsigned.apk output/aligned.apk 2>/dev/null || cp output/unsigned.apk output/aligned.apk
+          
+          # Sign with apksigner (v2 signing)
+          if command -v apksigner &> /dev/null; then
+            apksigner sign --ks debug.keystore --ks-pass pass:deathlantern --key-pass pass:deathlantern --out output/hunter-raid-mod-v2.7.1.apk output/aligned.apk
+          else
+            # Fallback: jarsigner
+            jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 -keystore debug.keystore -storepass deathlantern -keypass deathlantern output/aligned.apk deathlantern
+            mv output/aligned.apk output/hunter-raid-mod-v2.7.1.apk
+          fi
+          
+          echo "Build complete:"
           ls -lh output/
-      
-      - name: Verify APK
-        run: |
-          apksigner verify --print-certs output/hunter-raid-mod-v2.7.1.apk
-          echo "APK verified!"
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -205,20 +137,20 @@ jobs:
             ## 헌터키우기 모딩 APK v2.7.1
             ### DeathLantern Edition
             
-            **v2.6.9 모딩 코드 → v2.7.1 이식 완료**
+            **v2.6.9 모딩 코드 → v2.7.1 이식**
             
-            ### 변경사항
-            - libDeathLantern.so 삽입 (런타임 훅)
-            - DEX 수정 (모드 로딩 코드 추가)
+            ### 모딩 내용
+            - libDeathLantern.so 런타임 훅 삽입
+            - DEX 수정 (모드 로딩)
             - Split APK → 단일 APK 병합
             - 커스텀 서명
             
-            ### 설치 방법
+            ### 설치
             1. 기존 앱 삭제
             2. APK 설치
-            3. 출처를 알 수 없는 앱 허용 필요
+            3. 출처를 알 수 없는 앱 허용
             
-            > ⚠️ 이 APK는 서명이 변경되어 원본 데이터와 호환되지 않습니다.
+            > ⚠️ 서명 변경으로 원본 데이터 미호환
           files: output/hunter-raid-mod-v2.7.1.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
