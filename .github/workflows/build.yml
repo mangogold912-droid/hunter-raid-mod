@@ -23,6 +23,7 @@ jobs:
       - name: Install tools
         run: |
           wget -q "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar" -O /usr/local/bin/apktool.jar || true
+          pip3 install androguard requests
       
       - name: Download release assets
         env:
@@ -34,38 +35,42 @@ jobs:
           gh release download v2.6.9-mod --repo mangogold912-droid/hunter-raid-mod -p 'config.arm64_v8a.apk' -D temp/ || true
           gh release download v2.6.9-mod --repo mangogold912-droid/hunter-raid-mod -p 'libDeathLantern.so' || true
       
-      - name: Merge APKs
+      - name: Merge APKs into single APK
         run: |
-          python3 -c "
+          python3 << 'MERGE'
           import zipfile, os
+          
           config_libs = {}
-          with zipfile.ZipFile('temp/config.arm64_v8a.apk','r') as z:
+          with zipfile.ZipFile("temp/config.arm64_v8a.apk", "r") as z:
               for n in z.namelist():
-                  if n.startswith('lib/arm64-v8a/'):
+                  if n.startswith("lib/arm64-v8a/"):
                       config_libs[n] = z.read(n)
-          with open('libDeathLantern.so','rb') as f:
-              config_libs['lib/arm64-v8a/libDeathLantern.so'] = f.read()
-          with zipfile.ZipFile('temp/studio.gameberry.idlehunter.apk','r') as zin:
-              with zipfile.ZipFile('temp/merged.apk','w',zipfile.ZIP_DEFLATED) as zout:
+          
+          with open("libDeathLantern.so", "rb") as f:
+              config_libs["lib/arm64-v8a/libDeathLantern.so"] = f.read()
+          
+          with zipfile.ZipFile("temp/studio.gameberry.idlehunter.apk", "r") as zin:
+              with zipfile.ZipFile("temp/merged.apk", "w") as zout:
                   for item in zin.namelist():
-                      zout.writestr(item, zin.read(item))
-                  for n,d in config_libs.items():
+                      data = zin.read(item)
+                      zout.writestr(item, data)
+                  for n, d in config_libs.items():
                       zout.writestr(n, d)
-          print(f'Merged: {os.path.getsize("temp/merged.apk")//1024//1024}MB')
-          "
+          
+          print(f"Merged: {os.path.getsize('temp/merged.apk')//1024//1024}MB")
+          MERGE
       
-      - name: Decompile and fix manifest
+      - name: Decompile, patch, recompile (STORED/no compression)
         run: |
+          # Decompile
           java -jar /usr/local/bin/apktool.jar d temp/merged.apk -o temp/decompiled -f || true
           
-          # Create apktool.yml
+          # Create apktool.yml for STORED build
           cat > temp/decompiled/apktool.yml << 'YML'
           !!brut.androlib.apktool.MetaInfo
           apkFileName: merged.apk
           doNotCompress:
-            - resources.arsc
-            - assets/bin/Data/Managed/Metadata/global-metadata.dat
-            - png
+            - ""
           isFrameworkApk: false
           packageInfo:
             forcedPackageId: '127'
@@ -86,15 +91,15 @@ jobs:
             versionName: 2.7.1
           YML
           
-          # FIX: Remove split APK dependencies from AndroidManifest.xml
+          # FIX AndroidManifest.xml - remove split APK deps
+          echo "Fixing AndroidManifest.xml..."
           sed -i 's/ android:requiredSplitTypes="[^"]*"//g' temp/decompiled/AndroidManifest.xml
           sed -i 's/ android:splitTypes="[^"]*"//g' temp/decompiled/AndroidManifest.xml
           sed -i '/com\.android\.vending\.splits\.required/d' temp/decompiled/AndroidManifest.xml
           sed -i '/com\.android\.vending\.splits"/d' temp/decompiled/AndroidManifest.xml
-          echo "Manifest fixed!"
-      
-      - name: Create ModLoader smali
-        run: |
+          echo "Split deps removed from manifest"
+          
+          # Add ModLoader smali
           mkdir -p temp/decompiled/smali/com/deathlantern
           cat > temp/decompiled/smali/com/deathlantern/ModLoader.smali << 'SMALI'
           .class public Lcom/deathlantern/ModLoader;
@@ -112,21 +117,47 @@ jobs:
           .end method
           SMALI
           
-          # Patch activities
+          # Patch activities to load mod
           for f in $(find temp/decompiled/smali* -name "MessagingUnityPlayerActivity.smali" -o -name "UnityPlayerActivity.smali" 2>/dev/null); do
             if grep -q "onCreate" "$f" && ! grep -q "loadMod" "$f"; then
               echo "Patching $f..."
               sed -i 's/\.method public onCreate(Landroid\/os\/Bundle;)V/\.method public onCreate(Landroid\/os\/Bundle;)V\n    .registers 2\n\n    invoke-static {}, Lcom\/deathlantern\/ModLoader;->loadMod()V/' "$f"
             fi
           done
-      
-      - name: Build and sign
-        run: |
-          java -jar /usr/local/bin/apktool.jar b temp/decompiled -o output/unsigned.apk --use-aapt2 || {
-            echo "apktool failed, using direct merge"
-            cp temp/merged.apk output/unsigned.apk
-          }
           
+          # Recompile with apktool (resources)
+          java -jar /usr/local/bin/apktool.jar b temp/decompiled -o temp/rebuilt.apk --use-aapt2 || {
+            echo "apktool recompile failed"
+            cp temp/merged.apk temp/rebuilt.apk
+          }
+      
+      - name: Rebuild as STORED (no compression)
+        run: |
+          python3 << 'STORED'
+          import zipfile, os
+          
+          # Extract fixed AndroidManifest from rebuilt APK
+          with zipfile.ZipFile("temp/rebuilt.apk", "r") as z:
+              fixed_manifest = z.read("AndroidManifest.xml")
+          print(f"Fixed manifest: {len(fixed_manifest)} bytes")
+          
+          # Rebuild: take original merged APK, replace manifest, set all to STORED
+          with zipfile.ZipFile("temp/merged.apk", "r") as zin:
+              with zipfile.ZipFile("output/hunter-raid-mod-v2.7.1.apk", "w", zipfile.ZIP_STORED) as zout:
+                  for item in zin.infolelist():
+                      if item.filename == "AndroidManifest.xml":
+                          zout.writestr(item.filename, fixed_manifest)
+                          print(f"  [PATCH] {item.filename} ({len(fixed_manifest)} bytes)")
+                      else:
+                          data = zin.read(item.filename)
+                          zout.writestr(item.filename, data)
+          
+          size = os.path.getsize("output/hunter-raid-mod-v2.7.1.apk")
+          print(f"\nFinal APK: {size//1024//1024}MB (all files STORED)")
+          STORED
+      
+      - name: Sign APK
+        run: |
           keytool -genkeypair -v -keystore debug.keystore -alias deathlantern \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass deathlantern -keypass deathlantern \
@@ -134,9 +165,9 @@ jobs:
           
           jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
             -keystore debug.keystore -storepass deathlantern -keypass deathlantern \
-            output/unsigned.apk deathlantern
+            output/hunter-raid-mod-v2.7.1.apk deathlantern
           
-          mv output/unsigned.apk output/hunter-raid-mod-v2.7.1.apk
+          echo "Build complete:"
           ls -lh output/
       
       - name: Upload artifact
